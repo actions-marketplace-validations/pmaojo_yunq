@@ -1636,6 +1636,43 @@ fn drop_preexisting_findings(findings: &mut Vec<Finding>, old_findings: &[Findin
     });
 }
 
+/// Where `judge` should read the "before" content from when computing which
+/// findings are pre-existing (see [`drop_preexisting_findings`]).
+///
+/// `PreToolUse` is the only hook event where disk genuinely still holds the
+/// pre-write state at judgement time — everywhere else (`PostToolUse`,
+/// `Stop`, `vord hook check`) the write has already landed, so disk equals
+/// `content` and a disk-vs-disk diff is always empty, silently suppressing
+/// every content-based finding. Those callers must diff against the file's
+/// last-committed content instead, so "old" genuinely predates this write.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DiffBaseline {
+    /// Disk still holds the pre-write content (`PreToolUse`).
+    PreWriteDisk,
+    /// The write has already landed on disk; diff against `git show
+    /// HEAD:<path>` instead. A file absent from `HEAD` (newly created) has
+    /// no baseline, so every finding in it is reported as new.
+    GitHead,
+}
+
+/// Reads `<path>`'s content as of `HEAD`, or `None` if the file is not
+/// tracked yet, the repository has no commits, or `git` itself is
+/// unavailable — all of which mean "no pre-existing baseline", not an
+/// error.
+fn git_head_content(root: &Path, relative: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("show")
+        .arg(format!("HEAD:{relative}"))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
 /// Judges one proposed write end to end: policy, path, and (when content is
 /// available and parseable) findings.
 ///
@@ -1672,17 +1709,18 @@ pub async fn judge(
     root: &Path,
     file: &Path,
     content: Option<&str>,
+    baseline: DiffBaseline,
 ) -> anyhow::Result<Verdict> {
     let relative = relative_to(root, file);
     let mut findings = match content {
         Some(content) => analyze_content(root, &relative, content).await?,
         None => Vec::new(),
     };
-    // Only meaningful `PreToolUse`-side, where disk still holds the
-    // pre-write content: by the time a write has landed (`PostToolUse`,
-    // `hook check`), disk already matches `content` and the diff is empty.
     if let Some(content) = content {
-        let old_content = tokio::fs::read_to_string(file).await.ok();
+        let old_content = match baseline {
+            DiffBaseline::PreWriteDisk => tokio::fs::read_to_string(file).await.ok(),
+            DiffBaseline::GitHead => git_head_content(root, &relative),
+        };
         if let Some(old) = old_content.as_deref() {
             let old_findings = analyze_content(root, &relative, old).await?;
             drop_preexisting_findings(&mut findings, &old_findings);
@@ -2034,7 +2072,11 @@ async fn claude_code_verdict(raw: &str) -> anyhow::Result<(Verdict, LoopGuardRep
 
     let relative = relative_to(&root, &file);
     let loop_report = track_loop_guard(&root, &relative, content.as_deref());
-    let verdict = judge(&policy, &root, &file, content.as_deref()).await?;
+    let baseline = match payload.hook_event_name.as_str() {
+        "PreToolUse" => DiffBaseline::PreWriteDisk,
+        _ => DiffBaseline::GitHead,
+    };
+    let verdict = judge(&policy, &root, &file, content.as_deref(), baseline).await?;
     // Only meaningful post-write: a `PreToolUse` write may still be denied by
     // `judge()` above and never land, so nothing here has been proven to
     // exist yet.
@@ -2068,7 +2110,14 @@ pub async fn run_check(
     let content = tokio::fs::read_to_string(&file).await.ok();
     let relative = relative_to(&root, &file);
     let loop_report = track_loop_guard(&root, &relative, content.as_deref());
-    let verdict = judge(&policy, &root, &file, content.as_deref()).await?;
+    let verdict = judge(
+        &policy,
+        &root,
+        &file,
+        content.as_deref(),
+        DiffBaseline::GitHead,
+    )
+    .await?;
     let breaker = track_circuit_breaker(&root, &verdict);
     append_audit_log(&root, "check", &verdict, &breaker, &loop_report);
 
@@ -2308,6 +2357,7 @@ mod tests {
             root,
             Path::new("/repo/app.py"),
             Some("import os\nos.system(user_input)\n"),
+            DiffBaseline::PreWriteDisk,
         )
         .await
         .expect("judged");
@@ -2325,6 +2375,7 @@ mod tests {
             root,
             Path::new("/repo/app.py"),
             Some("import subprocess\nsubprocess.run(cmd, shell=True)\n"),
+            DiffBaseline::PreWriteDisk,
         )
         .await
         .expect("judged");
@@ -2339,6 +2390,7 @@ mod tests {
             Path::new("/repo"),
             Path::new("/repo/a.py"),
             Some("x = 1\n"),
+            DiffBaseline::PreWriteDisk,
         )
         .await
         .expect("judged");
@@ -3042,7 +3094,7 @@ Feature: Orders
         let policy =
             AgentPolicy::parse("[agent]\nblocking_rules = [\"bdd:uncovered-public-api\"]\n")
                 .expect("parses");
-        let verdict = judge(&policy, &dir, &file, Some("pub fn ship() {}\n"))
+        let verdict = judge(&policy, &dir, &file, Some("pub fn ship() {}\n"), DiffBaseline::PreWriteDisk)
             .await
             .expect("judged");
         assert!(
@@ -3067,6 +3119,7 @@ Feature: Orders
             &dir,
             &file,
             Some("@covers(core/domain/**)\nFeature: Orders\n"),
+            DiffBaseline::PreWriteDisk,
         )
         .await
         .expect("judged");
@@ -3292,7 +3345,7 @@ Feature: Orders
         let policy = AgentPolicy::parse("[agent]\nblocking_rules = [\"ai:suppression-added\"]\n")
             .expect("parses");
         let new_content = "#[allow(dead_code)]\nfn f() {}\n";
-        let verdict = judge(&policy, &dir, &file, Some(new_content))
+        let verdict = judge(&policy, &dir, &file, Some(new_content), DiffBaseline::PreWriteDisk)
             .await
             .expect("judged");
         assert!(matches!(verdict, Verdict::Deny { .. }), "got {verdict:?}");
@@ -3314,7 +3367,7 @@ Feature: Orders
             AgentPolicy::parse("[agent]\nblocking_rules = [\"supply-chain:new-dependency\"]\n")
                 .expect("parses");
         let new_content = r#"{"dependencies": {"left-pad": "1.0.0", "left-pad-plus": "0.0.1"}}"#;
-        let verdict = judge(&policy, &dir, &manifest, Some(new_content))
+        let verdict = judge(&policy, &dir, &manifest, Some(new_content), DiffBaseline::PreWriteDisk)
             .await
             .expect("judged");
         assert!(matches!(verdict, Verdict::Deny { .. }), "got {verdict:?}");
@@ -3474,7 +3527,7 @@ Feature: Orders
         // Append an unrelated top-level declaration; `Big`'s own methods,
         // and therefore its WMC, are untouched.
         let new_content = format!("{old_content}\nconst unrelated = 1;\n");
-        let verdict = judge(&policy, &dir, &file, Some(&new_content))
+        let verdict = judge(&policy, &dir, &file, Some(&new_content), DiffBaseline::PreWriteDisk)
             .await
             .expect("judged");
         assert!(
@@ -3497,12 +3550,97 @@ Feature: Orders
             .expect("parses");
 
         let new_content = high_wmc_class("Big");
-        let verdict = judge(&policy, &dir, &file, Some(&new_content))
+        let verdict = judge(&policy, &dir, &file, Some(&new_content), DiffBaseline::PreWriteDisk)
             .await
             .expect("judged");
         assert!(
             matches!(verdict, Verdict::Deny { .. }),
             "a write that newly crosses the WMC threshold must still be denied, got {verdict:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression test for issue #193: `run_check` and every hook event but
+    /// `PreToolUse` read `content` from disk *after* the write has already
+    /// landed, so a `PreWriteDisk` baseline would diff disk against itself
+    /// and silently drop every finding — including on a file whose entire
+    /// content is brand new, not just edited. `GitHead` must still deny in
+    /// that case, in an untracked directory with no `HEAD` at all.
+    #[tokio::test]
+    async fn git_head_baseline_denies_a_brand_new_file_with_no_pre_write_disk_state() {
+        let dir = std::env::temp_dir()
+            .join(format!("vord-hook-githead-new-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("evil.py");
+        let content = "import os\nos.system(user_input)\n";
+        // The write has already landed on disk, exactly as `run_check` and
+        // `PostToolUse`/`Stop` see it.
+        std::fs::write(&file, content).expect("write");
+
+        let verdict = judge(
+            &AgentPolicy::default(),
+            &dir,
+            &file,
+            Some(content),
+            DiffBaseline::GitHead,
+        )
+        .await
+        .expect("judged");
+        assert!(
+            matches!(verdict, Verdict::Deny { .. }),
+            "a self-diff against unchanged disk content must not suppress findings on a new file, got {verdict:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Same shape, but the file is actually tracked in git with a clean
+    /// last-committed revision: a `smells:ck-oo-metrics` violation already
+    /// present at `HEAD` must still be dropped as pre-existing, so
+    /// `GitHead` doesn't just deny everything unconditionally.
+    #[tokio::test]
+    async fn git_head_baseline_drops_a_finding_already_present_at_head() {
+        let dir = std::env::temp_dir()
+            .join(format!("vord-hook-githead-preexisting-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("big.ts");
+        let old_content = high_wmc_class("Big");
+        std::fs::write(&file, &old_content).expect("write");
+
+        let run_git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .expect("git runs")
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "test"]);
+        run_git(&["add", "big.ts"]);
+        run_git(&["commit", "-q", "-m", "initial"]);
+
+        // Land an unrelated addition on disk, as `PostToolUse`/`run_check`
+        // would see it after the write.
+        let new_content = format!("{old_content}\nconst unrelated = 1;\n");
+        std::fs::write(&file, &new_content).expect("write");
+
+        let policy = AgentPolicy::parse("[agent]\nblocking_rules = [\"smells:ck-oo-metrics\"]\n")
+            .expect("parses");
+        let verdict = judge(
+            &policy,
+            &dir,
+            &file,
+            Some(&new_content),
+            DiffBaseline::GitHead,
+        )
+        .await
+        .expect("judged");
+        assert!(
+            !matches!(verdict, Verdict::Deny { .. }),
+            "an unrelated edit to a file that already violated WMC at HEAD must not be denied, got {verdict:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -3540,7 +3678,7 @@ Feature: Orders
         // is touched, but every line below it, including `busy`'s, shifts
         // down by one.
         let new_content = format!("// explains the module\n{old_content}");
-        let verdict = judge(&policy, &dir, &file, Some(&new_content))
+        let verdict = judge(&policy, &dir, &file, Some(&new_content), DiffBaseline::PreWriteDisk)
             .await
             .expect("judged");
         assert!(
@@ -3564,7 +3702,7 @@ Feature: Orders
             .expect("parses");
 
         let new_content = high_complexity_function("busy");
-        let verdict = judge(&policy, &dir, &file, Some(&new_content))
+        let verdict = judge(&policy, &dir, &file, Some(&new_content), DiffBaseline::PreWriteDisk)
             .await
             .expect("judged");
         assert!(
@@ -3586,7 +3724,7 @@ Feature: Orders
             "[[gherkin_required]]\npattern = \"core/domain/**\"\nreason = \"needs a scenario\"\n",
         )
         .expect("parses");
-        let verdict = judge(&policy, &dir, &file, Some("struct Order;\n"))
+        let verdict = judge(&policy, &dir, &file, Some("struct Order;\n"), DiffBaseline::PreWriteDisk)
             .await
             .expect("judged");
         let Verdict::Deny { evaluation, .. } = &verdict else {
@@ -3620,7 +3758,7 @@ Feature: Orders
             "[[gherkin_required]]\npattern = \"core/domain/**\"\nreason = \"needs a scenario\"\n",
         )
         .expect("parses");
-        let verdict = judge(&policy, &dir, &file, Some("struct Order;\n"))
+        let verdict = judge(&policy, &dir, &file, Some("struct Order;\n"), DiffBaseline::PreWriteDisk)
             .await
             .expect("judged");
         if let Verdict::Deny { evaluation, .. } = &verdict {
@@ -3656,7 +3794,7 @@ Feature: Orders
             "[[gherkin_required]]\npattern = \"core/domain/**\"\nreason = \"needs a scenario\"\n",
         )
         .expect("parses");
-        let verdict = judge(&policy, &dir, &file, Some("struct Order;\n"))
+        let verdict = judge(&policy, &dir, &file, Some("struct Order;\n"), DiffBaseline::PreWriteDisk)
             .await
             .expect("judged");
         let Verdict::Deny { evaluation, .. } = &verdict else {
@@ -3718,7 +3856,7 @@ Feature: Orders
         .expect("parses");
         let file = dir.join("a.py");
         let content = "import subprocess\nsubprocess.run(cmd, shell=True)\n";
-        let verdict = judge(&policy, &dir, &file, Some(content))
+        let verdict = judge(&policy, &dir, &file, Some(content), DiffBaseline::PreWriteDisk)
             .await
             .expect("judged");
         match &verdict {
@@ -3765,7 +3903,7 @@ Feature: Orders
         let file = dir.join("a.py");
         let content = "import subprocess\nsubprocess.run(cmd, shell=True)\n";
 
-        let first = judge(&policy, &dir, &file, Some(content))
+        let first = judge(&policy, &dir, &file, Some(content), DiffBaseline::PreWriteDisk)
             .await
             .expect("judged");
         let Verdict::Deny { path, evaluation } = &first else {
@@ -3777,7 +3915,7 @@ Feature: Orders
         // A byte-identical retry now reproduces the identical finding, so
         // `judge` re-derives the identical token, finds it approved, and
         // consumes it — letting the write through as if it were clean.
-        let second = judge(&policy, &dir, &file, Some(content))
+        let second = judge(&policy, &dir, &file, Some(content), DiffBaseline::PreWriteDisk)
             .await
             .expect("judged");
         assert!(
@@ -3786,7 +3924,7 @@ Feature: Orders
         );
 
         // Approval is single-use: a third identical attempt must escalate again.
-        let third = judge(&policy, &dir, &file, Some(content))
+        let third = judge(&policy, &dir, &file, Some(content), DiffBaseline::PreWriteDisk)
             .await
             .expect("judged");
         assert!(
