@@ -131,6 +131,31 @@ pub struct AgentSettings {
     /// Wall-clock seconds a `run` command may take before it is killed
     /// (adapter default 300).
     pub command_timeout_secs: Option<u64>,
+    /// Shell command that runs the project's tests. When set, `vord agent
+    /// fill` works each hole RED → GREEN: a failing test first, then the
+    /// code, each phase checked by running this command.
+    pub test_command: Option<String>,
+    /// `[agent.refactor]` — what `vord agent run --refactor` holds a task to
+    /// beyond "no new findings". Only read when `--refactor` is passed.
+    pub refactor: Option<RefactorSettings>,
+}
+
+/// `[agent.refactor]` in `vord.toml`.
+///
+/// ```toml
+/// [agent.refactor]
+/// preserve_behaviour = true          # default: reject semantic drift
+/// [agent.refactor.tolerances]
+/// import_edges = 2                   # may worsen by up to 2
+/// ```
+///
+/// Tolerance keys are `vord_agent::Dimension` names; an unknown key is a
+/// configuration error at run time, not a silent no-op.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RefactorSettings {
+    pub preserve_behaviour: Option<bool>,
+    #[serde(default)]
+    pub tolerances: std::collections::BTreeMap<String, i64>,
 }
 
 /// `[swarm]` in `vord.toml` — worktree-per-agent isolation and role config
@@ -184,6 +209,14 @@ pub struct RoleSettings {
     /// policy's `escalate_rules`.
     #[serde(default)]
     pub escalate_rules: Vec<String>,
+    /// Model this role's agent runs on, overriding `VORD_LLM_MODEL` — so a
+    /// planner, a refactorer and a verifier can each use the model that is
+    /// best at its own sub-task.
+    pub model: Option<String>,
+    /// Holds this role's runs to `[agent.refactor]`'s guard, as
+    /// `vord agent run --refactor` would.
+    #[serde(default)]
+    pub refactor: bool,
 }
 
 /// Same shape as `vord-policy.toml`'s `[[protected_path]]`, declared inline
@@ -528,6 +561,7 @@ worktree_root = ".vord/worktrees"
 
 [[swarm.role]]
 name = "coder"
+model = "qwen2.5-coder:32b"
 
 [[swarm.role]]
 name = "qa"
@@ -547,7 +581,12 @@ reason = "QA is read-only"
         assert_eq!(config.swarm.roles.len(), 2);
         assert_eq!(config.swarm.roles[0].name, "coder");
         assert!(config.swarm.roles[0].protected_paths.is_empty());
+        assert_eq!(
+            config.swarm.roles[0].model.as_deref(),
+            Some("qwen2.5-coder:32b")
+        );
         let qa = &config.swarm.roles[1];
+        assert_eq!(qa.model, None, "a role without `model` keeps the default");
         assert_eq!(qa.name, "qa");
         assert_eq!(qa.branch.as_deref(), Some("vord/swarm/qa-custom"));
         assert_eq!(qa.blocking_rules, vec!["owasp:eval-usage".to_string()]);
@@ -596,7 +635,11 @@ ignore_keys = ["value", "preset", "payload"]
         let config: VordConfig = toml::from_str(toml_content).unwrap();
         assert_eq!(
             config.secrets.ignore_keys,
-            vec!["value".to_string(), "preset".to_string(), "payload".to_string()]
+            vec![
+                "value".to_string(),
+                "preset".to_string(),
+                "payload".to_string()
+            ]
         );
     }
 

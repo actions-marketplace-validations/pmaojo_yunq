@@ -23,10 +23,13 @@ use std::path::{Path, PathBuf};
 
 use vord_agent::completion::LocatedFinding;
 use vord_agent::feedback::{FeedbackOutcome, FeedbackWatch, TriageLedger, Watch, WatchPolicy};
+use vord_agent::quality::COMPLEX_FUNCTION_THRESHOLD;
 use vord_agent::runtime::{
     AgentRuntime, AnalysisError, Analyzer, JudgeError, RunConfig, RunOutcome, WriteJudge,
 };
-use vord_agent::{Budget, CommandAllowlist};
+use vord_agent::{
+    Budget, CommandAllowlist, Dimension, QualityVector, RefactorGuard, Snapshot, Tolerances,
+};
 use vord_agent_policy::{AgentPolicy, Evaluation};
 use vord_infra_fs::{RepoWorkspace, VordConfig};
 use vord_infra_github::PullRequestFeedbackReader;
@@ -100,14 +103,18 @@ impl RepoAnalyzer {
     }
 }
 
-impl Analyzer for RepoAnalyzer {
-    async fn scan(&self, path: &str) -> Result<Vec<LocatedFinding>, AnalysisError> {
+impl RepoAnalyzer {
+    /// One scan of `path` under the project's `vord.toml` scope.
+    pub async fn report(
+        &self,
+        path: &str,
+    ) -> Result<vord_rules_engine::AnalysisReport, AnalysisError> {
         let target = self.root.join(path);
         // `sources` scopes a whole-repository scan; asking for one subtree
         // already *is* the scope, and intersecting the two would silently
         // return nothing whenever the subtree is not itself a source dir.
         let sources: &[String] = if path == "." { &self.sources } else { &[] };
-        let report = crate::scan_with_project_config(
+        crate::scan_with_project_config(
             &target,
             None,
             sources,
@@ -117,9 +124,79 @@ impl Analyzer for RepoAnalyzer {
             &Default::default(),
         )
         .await
-        .map_err(|e| AnalysisError(e.to_string()))?;
-        Ok(report_findings(&report))
+        .map_err(|e| AnalysisError(e.to_string()))
     }
+}
+
+impl Analyzer for RepoAnalyzer {
+    async fn scan(&self, path: &str) -> Result<Vec<LocatedFinding>, AnalysisError> {
+        Ok(report_findings(&self.report(path).await?))
+    }
+
+    /// One scan, plus the scope's import graph and semantic fingerprint —
+    /// what a `--refactor` run judges on top of the findings.
+    async fn snapshot(&self, path: &str) -> Result<Snapshot, AnalysisError> {
+        let report = self.report(path).await?;
+        let target = self.root.join(path);
+        let graph = vord_infra_fs::build_dependency_graph(&target)
+            .map_err(|e| AnalysisError(format!("cannot build the dependency graph: {e}")))?;
+        Ok(Snapshot {
+            findings: report_findings(&report),
+            quality: Some(quality_vector(&report, &graph.graph)),
+            semantics: Some(semantic_fingerprint(&target)?),
+        })
+    }
+}
+
+/// The dimensions `vord_agent::quality` compares, read off one report and
+/// the scope's import graph.
+fn quality_vector(
+    report: &vord_rules_engine::AnalysisReport,
+    graph: &vord_import_graph::ImportGraph,
+) -> QualityVector {
+    let complexities = report.function_complexities();
+    let complex = complexities
+        .iter()
+        .filter(|f| f.cyclomatic > COMPLEX_FUNCTION_THRESHOLD)
+        .count();
+    let max_cyclomatic = complexities.iter().map(|f| f.cyclomatic).max().unwrap_or(0);
+    let metrics = report.metrics();
+    QualityVector::default()
+        .with(Dimension::HealthScore, i64::from(report.health_score()))
+        .with(Dimension::DebtMinutes, metrics.debt_minutes() as i64)
+        .with(
+            Dimension::DuplicatedLines,
+            metrics.duplicated_lines() as i64,
+        )
+        .with(Dimension::ComplexFunctions, complex as i64)
+        .with(Dimension::MaxCyclomatic, i64::from(max_cyclomatic))
+        .with(Dimension::ImportEdges, graph.edges().len() as i64)
+        .with(
+            Dimension::ComponentEdges,
+            graph.component_edges().len() as i64,
+        )
+        .with(Dimension::ImportCycles, graph.cycles().len() as i64)
+}
+
+/// Every parseable source under `target`, fingerprinted and merged into one
+/// — so code moved between files inside the scope is not drift.
+fn semantic_fingerprint(target: &Path) -> Result<vord_ast::SemanticFingerprint, AnalysisError> {
+    let parsers: std::collections::HashMap<_, _> = crate::all_default_parsers()
+        .into_iter()
+        .map(|parser| (parser.language(), parser))
+        .collect();
+    let sources = vord_infra_fs::collect_sources(target)
+        .map_err(|e| AnalysisError(format!("cannot read sources for the fingerprint: {e}")))?;
+    let mut merged = vord_ast::SemanticFingerprint::default();
+    for file in &sources {
+        let Some(parser) = parsers.get(file.language()) else {
+            continue;
+        };
+        if let Ok(tree) = parser.parse(file) {
+            merged.merge(&vord_ast::SemanticFingerprint::of(&tree));
+        }
+    }
+    Ok(merged)
 }
 
 /// Issues *and* hotspots, for the same reason [`crate::hook::analyze_content`]
@@ -155,6 +232,8 @@ pub struct AgentArgs {
     pub max_turns: Option<u32>,
     pub max_tokens: Option<u64>,
     pub model: Option<String>,
+    /// Hold the run to the refactor guard (`--refactor`).
+    pub refactor: bool,
 }
 
 /// Builds the run's configuration from the CLI arguments layered over
@@ -194,6 +273,36 @@ fn run_config(
         max_rejections: settings
             .max_rejections
             .unwrap_or(RunConfig::new("").max_rejections),
+        refactor: if args.refactor {
+            Some(refactor_guard(settings.refactor.as_ref())?)
+        } else {
+            None
+        },
+    })
+}
+
+/// `[agent.refactor]` as a [`RefactorGuard`]. Behaviour preservation is on
+/// unless explicitly turned off; every tolerance key must name a real
+/// dimension, since a misspelt one would otherwise tolerate nothing silently.
+fn refactor_guard(
+    settings: Option<&vord_infra_fs::RefactorSettings>,
+) -> anyhow::Result<RefactorGuard> {
+    let mut tolerances = Tolerances::default();
+    if let Some(settings) = settings {
+        for (key, allowed) in &settings.tolerances {
+            let dimension = Dimension::parse(key).ok_or_else(|| {
+                let known: Vec<&str> = Dimension::ALL.iter().map(|d| d.as_str()).collect();
+                anyhow::anyhow!(
+                    "[agent.refactor.tolerances] names unknown dimension {key:?}; known: {}",
+                    known.join(", ")
+                )
+            })?;
+            tolerances = tolerances.allow(dimension, *allowed);
+        }
+    }
+    Ok(RefactorGuard {
+        tolerances,
+        preserve_behaviour: settings.and_then(|s| s.preserve_behaviour).unwrap_or(true),
     })
 }
 
@@ -272,6 +381,105 @@ pub async fn run_with_policy_and_observer(
     )
     .with_observer(observer);
     Ok(runtime.run().await)
+}
+
+// ---------------------------------------------------------------------------
+// The analyzer as the definition of done, for a host vord does not drive
+// ---------------------------------------------------------------------------
+
+/// Where `vord agent baseline` writes by default and `vord agent done` reads.
+pub const DONE_BASELINE_FILE: &str = ".vord/agent-baseline.json";
+
+/// The on-disk form of a [`LocatedFinding`]. `core/agent` stays free of
+/// serde, so the CLI owns this mirror.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredFinding {
+    file: String,
+    rule: String,
+    severity: String,
+    message: String,
+    line: u32,
+}
+
+impl From<&LocatedFinding> for StoredFinding {
+    fn from(finding: &LocatedFinding) -> Self {
+        Self {
+            file: finding.file.clone(),
+            rule: finding.rule.to_string(),
+            severity: finding.severity.as_str().to_string(),
+            message: finding.message.clone(),
+            line: finding.line,
+        }
+    }
+}
+
+impl StoredFinding {
+    fn into_finding(self) -> anyhow::Result<LocatedFinding> {
+        Ok(LocatedFinding {
+            rule: RuleId::new(&self.rule)
+                .map_err(|_| anyhow::anyhow!("invalid rule id {:?} in baseline", self.rule))?,
+            severity: vord_rules_engine::Severity::parse(&self.severity).ok_or_else(|| {
+                anyhow::anyhow!("invalid severity {:?} in baseline", self.severity)
+            })?,
+            file: self.file,
+            message: self.message,
+            line: self.line,
+        })
+    }
+}
+
+/// `vord agent baseline`: records what the analyzer sees over `scope` now,
+/// before a host's agent starts, so [`check_done`] can later tell findings
+/// the agent introduced from ones the repository already had. Returns how
+/// many findings were recorded.
+pub async fn write_baseline(root: &Path, scope: &str, out: &Path) -> anyhow::Result<usize> {
+    let config = VordConfig::load_from_dir(root);
+    let findings = RepoAnalyzer::new(root, config.as_ref())
+        .scan(scope)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e.0))?;
+    let stored: Vec<StoredFinding> = findings.iter().map(StoredFinding::from).collect();
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(out, serde_json::to_string(&stored)?)?;
+    Ok(stored.len())
+}
+
+/// `vord agent done`: the same verdict `vord agent run` reaches before it
+/// lets a session finish — re-scan `scope` and compare against the recorded
+/// baseline — offered to any host's agent loop (DeepSeek Harness's
+/// `agent/turn-stopping`, a CI step). No model is consulted.
+pub async fn check_done(
+    root: &Path,
+    scope: &str,
+    baseline: &Path,
+    rule: Option<&str>,
+) -> anyhow::Result<vord_agent::completion::Completion> {
+    let raw = std::fs::read_to_string(baseline).map_err(|e| {
+        anyhow::anyhow!(
+            "no baseline at {} ({e}); run `vord agent baseline` first",
+            baseline.display()
+        )
+    })?;
+    let stored: Vec<StoredFinding> = serde_json::from_str(&raw)?;
+    let before = stored
+        .into_iter()
+        .map(StoredFinding::into_finding)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let target = rule
+        .map(|raw| RuleId::new(raw).map_err(|_| anyhow::anyhow!("invalid rule id {raw:?}")))
+        .transpose()?;
+    let config = VordConfig::load_from_dir(root);
+    let after = RepoAnalyzer::new(root, config.as_ref())
+        .scan(scope)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e.0))?;
+    Ok(vord_agent::completion::judge(
+        &before,
+        &after,
+        target.as_ref(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -405,6 +613,7 @@ mod tests {
             max_turns: None,
             max_tokens: None,
             model: None,
+            refactor: false,
         }
     }
 
@@ -524,6 +733,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_snapshot_measures_quality_and_catches_a_flipped_comparison() {
+        let root = std::env::temp_dir().join(format!("vord-agent-snapshot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let write = |body: &str| std::fs::write(root.join("src/limits.py"), body).unwrap();
+        let analyzer = RepoAnalyzer::new(&root, None);
+
+        write("def over(x):\n    if x > 10:\n        raise ValueError(\"too big\")\n");
+        let before = analyzer.snapshot(".").await.unwrap();
+        let quality = before.quality.as_ref().expect("quality measured");
+        assert!(quality.get(Dimension::HealthScore).is_some());
+        assert_eq!(quality.get(Dimension::ImportCycles), Some(0));
+        let semantics = before.semantics.as_ref().expect("fingerprint taken");
+        assert_eq!(semantics.count("op:>"), 1, "{semantics:?}");
+        assert_eq!(semantics.count("lit:10"), 1, "{semantics:?}");
+
+        // A rename is a refactor...
+        write("def exceeds(value):\n    if value > 10:\n        raise ValueError(\"too big\")\n");
+        let renamed = analyzer.snapshot(".").await.unwrap();
+        assert!(
+            semantics
+                .drift(renamed.semantics.as_ref().unwrap())
+                .is_empty()
+        );
+
+        // ...an off-by-one is not.
+        write("def exceeds(value):\n    if value >= 10:\n        raise ValueError(\"too big\")\n");
+        let flipped = analyzer.snapshot(".").await.unwrap();
+        let drift = semantics.drift(flipped.semantics.as_ref().unwrap());
+        assert_eq!(drift.appeared, vec!["op:>=".to_string()]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn refactor_settings_become_a_guard_and_reject_unknown_dimensions() {
+        let refactor = AgentArgs {
+            refactor: true,
+            ..args()
+        };
+        let guard = run_config(&refactor, &AgentSettings::default())
+            .unwrap()
+            .refactor
+            .expect("--refactor sets a guard");
+        assert!(
+            guard.preserve_behaviour,
+            "behaviour preservation defaults on"
+        );
+
+        let settings = AgentSettings {
+            refactor: Some(vord_infra_fs::RefactorSettings {
+                preserve_behaviour: Some(false),
+                tolerances: [("import_edges".to_string(), 3)].into(),
+            }),
+            ..AgentSettings::default()
+        };
+        let guard = run_config(&refactor, &settings).unwrap().refactor.unwrap();
+        assert!(!guard.preserve_behaviour);
+        assert_eq!(guard.tolerances.allowed(Dimension::ImportEdges), 3);
+
+        let typo = AgentSettings {
+            refactor: Some(vord_infra_fs::RefactorSettings {
+                preserve_behaviour: None,
+                tolerances: [("import_edgez".to_string(), 3)].into(),
+            }),
+            ..AgentSettings::default()
+        };
+        assert!(run_config(&refactor, &typo).is_err());
+        assert!(run_config(&args(), &typo).unwrap().refactor.is_none());
+    }
+
+    #[tokio::test]
     async fn the_write_judge_denies_a_blocking_rule_and_leaves_an_audit_line() {
         let root = std::env::temp_dir().join(format!("vord-agent-judge-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -545,6 +825,62 @@ mod tests {
         let audit = std::fs::read_to_string(root.join(hook::AUDIT_LOG_FILE)).unwrap();
         assert!(audit.contains("\"event\":\"AgentWrite\""), "{audit}");
         assert!(audit.contains("\"outcome\":\"deny\""), "{audit}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn done_disagrees_only_with_findings_introduced_after_the_baseline() {
+        let root = std::env::temp_dir().join(format!("vord-agent-done-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // A finding the repository already had must not count against the task.
+        std::fs::write(
+            root.join("src/old.py"),
+            "import subprocess\nsubprocess.run(cmd, shell=True)\n",
+        )
+        .unwrap();
+        let baseline = root.join(DONE_BASELINE_FILE);
+        assert!(write_baseline(&root, ".", &baseline).await.unwrap() > 0);
+
+        let verdict = check_done(&root, ".", &baseline, None).await.unwrap();
+        assert!(verdict.is_done(), "{}", verdict.describe());
+
+        std::fs::write(
+            root.join("src/new.py"),
+            "import subprocess\nsubprocess.run(other, shell=True)\n",
+        )
+        .unwrap();
+        let verdict = check_done(&root, ".", &baseline, None).await.unwrap();
+        assert!(!verdict.is_done());
+        assert!(
+            verdict.describe().contains("new.py"),
+            "{}",
+            verdict.describe()
+        );
+
+        let verdict = check_done(&root, ".", &baseline, Some("python:subprocess-shell-true"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                verdict,
+                vord_agent::completion::Completion::TargetRemains { .. }
+            ),
+            "a named target rule still firing anywhere keeps the task open"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn done_without_a_baseline_is_an_error_not_a_verdict() {
+        let root =
+            std::env::temp_dir().join(format!("vord-agent-done-none-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(
+            check_done(&root, ".", &root.join("missing.json"), None)
+                .await
+                .is_err()
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

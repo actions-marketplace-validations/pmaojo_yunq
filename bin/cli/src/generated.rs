@@ -1,0 +1,226 @@
+//! The generated-code manifest: which files a scaffolding engine produced,
+//! from what, and how to regenerate them. `vord kickoff --engine` writes it;
+//! the write gate reads it so an agent fills holes instead of hand-editing
+//! generated structure. The skeleton/hole logic itself is pure and lives in
+//! `vord_agent_policy::generated`.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+use vord_agent_policy::generated::{first_skeleton_change, hole_count, HOLE_CLOSE, HOLE_OPEN};
+use vord_agent_policy::Finding;
+use vord_rules_engine::RuleId;
+
+/// Repository-relative location of the manifest.
+pub const MANIFEST_FILE: &str = ".vord/generated.json";
+
+/// The rule a hand edit to generated structure is reported under.
+pub const RULE: &str = "generated:edit-outside-hole";
+
+/// How a recorded file relates to its generator.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    /// Rebuilt from a blueprint or DSL (Symfony-style): hand edits would be
+    /// discarded on the next regeneration, so the write gate blocks them.
+    #[default]
+    Regenerable,
+    /// A one-pass scaffold (Rails-style): a starting point with no source to
+    /// regenerate it from. Recorded for provenance, fully editable.
+    Seed,
+}
+
+impl Kind {
+    fn is_regenerable(&self) -> bool {
+        *self == Kind::Regenerable
+    }
+}
+
+/// Where one generated file came from.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GeneratedFile {
+    /// The engine that produced it (`kthulu`, `ferrum`, `wasp`, `vord`).
+    pub engine: String,
+    /// The blueprint it was generated from, when there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// The command that regenerates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regenerate: Option<String>,
+    /// `regenerable` (the default, and what older manifests mean) or `seed`.
+    #[serde(default, skip_serializing_if = "Kind::is_regenerable")]
+    pub kind: Kind,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Manifest {
+    /// Repository-relative path → provenance.
+    #[serde(default)]
+    pub files: BTreeMap<String, GeneratedFile>,
+}
+
+impl Manifest {
+    /// The manifest under `root`, or an empty one when there is none (or it
+    /// cannot be parsed — a corrupt manifest must not wedge every write).
+    pub fn load(root: &Path) -> Self {
+        std::fs::read_to_string(root.join(MANIFEST_FILE))
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, root: &Path) -> std::io::Result<()> {
+        let path = root.join(MANIFEST_FILE);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        std::fs::write(path, json + "\n")
+    }
+}
+
+/// A finding when a proposed write to a generated file changes anything
+/// outside its holes. `current` is the file as it is on disk now; a generated
+/// file that does not exist is regenerated, not rewritten by hand, so a
+/// missing `current` counts as an empty skeleton.
+pub fn findings(
+    manifest: &Manifest,
+    relative: &str,
+    current: Option<&str>,
+    proposed: &str,
+) -> Vec<Finding> {
+    if manifest.files.get(relative).is_some_and(|e| e.kind == Kind::Seed) {
+        return Vec::new();
+    }
+    let current = current.unwrap_or("");
+    // A file that declares holes says by itself which parts are hand-written,
+    // whether or not a kickoff recorded it: a generator vord did not run
+    // (or a file copied in later) is held to its own markers.
+    let unrecorded;
+    let entry = match manifest.files.get(relative) {
+        Some(entry) => entry,
+        None if hole_count(current) > 0 => {
+            unrecorded = GeneratedFile {
+                engine: "its generator".into(),
+                source: None,
+                regenerate: None,
+                kind: Kind::Regenerable,
+            };
+            &unrecorded
+        }
+        None => return Vec::new(),
+    };
+    let Some(line) = first_skeleton_change(current, proposed) else {
+        return Vec::new();
+    };
+    let source = entry
+        .source
+        .as_deref()
+        .map(|s| format!(" from `{s}`"))
+        .unwrap_or_default();
+    let remedy = match &entry.regenerate {
+        Some(command) => format!("change the blueprint and run `{command}`"),
+        None => format!("change the blueprint and regenerate with {}", entry.engine),
+    };
+    let holes = match hole_count(current) {
+        0 => "it has no hand-editable regions".to_string(),
+        n => format!("only the {n} region(s) between `{HOLE_OPEN}` and `{HOLE_CLOSE}` may be edited by hand"),
+    };
+    vec![Finding {
+        rule: RuleId::new(RULE).expect("valid rule id"),
+        severity: vord_rules_engine::Severity::Blocker,
+        message: format!(
+            "{relative} is generated by {}{source}; {holes}. This write changes generated structure — {remedy} \
+             instead of editing it, so the next regeneration does not discard the change",
+            entry.engine
+        ),
+        line,
+    }]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest() -> Manifest {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "internal/order/service.go".to_string(),
+            GeneratedFile {
+                engine: "kthulu".into(),
+                source: Some("kthulu-plan.yaml".into()),
+                regenerate: Some("kthulu generate".into()),
+                ..Default::default()
+            },
+        );
+        Manifest { files }
+    }
+
+    const SERVICE: &str = "func Place(o Order) error {\n\t// vord:hole place-rules\n\t// vord:end-hole\n\treturn repo.Save(o)\n}\n";
+
+    #[test]
+    fn a_seed_is_recorded_but_never_blocked() {
+        let mut m = manifest();
+        m.files.get_mut("internal/order/service.go").unwrap().kind = Kind::Seed;
+        assert!(findings(&m, "internal/order/service.go", Some(SERVICE), "package other\n").is_empty());
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("\"kind\":\"seed\""));
+        // Older manifests have no kind: they stay regenerable.
+        let old: Manifest = serde_json::from_str(r#"{"files":{"a.go":{"engine":"kthulu"}}}"#).unwrap();
+        assert_eq!(old.files["a.go"].kind, Kind::Regenerable);
+    }
+
+    #[test]
+    fn filling_a_hole_in_a_generated_file_is_allowed() {
+        let filled = SERVICE.replace(
+            "\t// vord:hole place-rules\n",
+            "\t// vord:hole place-rules\n\tif o.Total <= 0 { return ErrEmpty }\n",
+        );
+        assert!(findings(&manifest(), "internal/order/service.go", Some(SERVICE), &filled).is_empty());
+    }
+
+    #[test]
+    fn editing_generated_structure_names_the_blueprint_and_the_regenerate_command() {
+        let edited = SERVICE.replace("repo.Save(o)", "repo.Upsert(o)");
+        let found = findings(&manifest(), "internal/order/service.go", Some(SERVICE), &edited);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].rule.to_string(), RULE);
+        assert_eq!(found[0].line, 4);
+        assert!(found[0].message.contains("kthulu-plan.yaml"), "{}", found[0].message);
+        assert!(found[0].message.contains("`kthulu generate`"), "{}", found[0].message);
+    }
+
+    #[test]
+    fn files_outside_the_manifest_are_not_judged() {
+        assert!(findings(&manifest(), "internal/order/custom.go", Some("a"), "b").is_empty());
+    }
+
+    #[test]
+    fn a_file_that_declares_holes_is_held_to_them_without_a_manifest_entry() {
+        let edited = SERVICE.replace("repo.Save(o)", "repo.Upsert(o)");
+        let found = findings(&Manifest::default(), "pkg/other.go", Some(SERVICE), &edited);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].message.contains("generated by its generator"), "{}", found[0].message);
+        let filled = SERVICE.replace(
+            "\t// vord:hole place-rules\n",
+            "\t// vord:hole place-rules\n\tif o.Total <= 0 { return ErrEmpty }\n",
+        );
+        assert!(findings(&Manifest::default(), "pkg/other.go", Some(SERVICE), &filled).is_empty());
+    }
+
+    #[test]
+    fn recreating_a_deleted_generated_file_by_hand_is_a_skeleton_change() {
+        assert!(!findings(&manifest(), "internal/order/service.go", None, SERVICE).is_empty());
+    }
+
+    #[test]
+    fn the_manifest_round_trips_and_a_missing_one_is_empty() {
+        let root = std::env::temp_dir().join(format!("vord-generated-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(Manifest::load(&root), Manifest::default());
+        manifest().save(&root).unwrap();
+        assert_eq!(Manifest::load(&root), manifest());
+        std::fs::remove_dir_all(&root).ok();
+    }
+}

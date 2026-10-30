@@ -9,16 +9,21 @@ use vord_cli::output;
 use vord_infra_fs::{BaselineStore, FileAnalysisCache};
 use vord_rules_engine::{Baseline, NewCodeAnalysis, Severity};
 
+mod app_spec;
 mod arch;
 mod blame;
 mod ci_detect;
 mod crap;
 mod flow;
+mod generator_defects;
 mod hook_install;
 mod kickoff;
+mod kickoff_engine;
 mod mcp;
 mod monorepo_scan;
+mod prune;
 mod tui;
+mod verify;
 mod wizard;
 
 #[derive(Parser)]
@@ -74,6 +79,13 @@ enum Command {
         #[command(subcommand)]
         action: SwarmAction,
     },
+    /// Continuous refactoring: rank what to refactor from complexity,
+    /// coverage, the import graph and git history, then refactor the top
+    /// candidates under the refactor guard.
+    Refactor {
+        #[command(subcommand)]
+        action: RefactorAction,
+    },
     /// Issue Triage Factory: drive a GitHub issue through reproduce →
     /// diagnose → fix, one step at a time (roadmap C).
     Triage {
@@ -87,14 +99,136 @@ enum Command {
         #[command(subcommand)]
         action: FlowAction,
     },
+    /// List the holes the blueprints leave open: `vord:hole` regions still
+    /// empty or holding a placeholder, and Wasp operations `main.wasp`
+    /// imports but nobody implemented. Deterministic; no model involved.
+    Holes {
+        /// Directory to look in.
+        #[arg(default_value = ".")]
+        path: String,
+        /// Print the holes as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Exit 3 when any hole is pending (for CI).
+        #[arg(long)]
+        check: bool,
+    },
     /// Kickoff a new project template for AI-driven development.
     Kickoff {
         /// Template name (react-bulletproof, rust-clean, python-clean, typescript-clean, fullstack-hexagonal).
+        /// Ignored with `--engine`.
         #[arg(default_value = "react-bulletproof")]
         template: String,
-        /// Target directory.
+        /// Target directory (with `--engine`, the parent the project is created in).
         #[arg(long, default_value = ".")]
         path: PathBuf,
+        /// Generate with a scaffolding engine instead of a built-in template:
+        /// kthulu (Go), ferrum (Rust + React) or wasp (React + Node + Prisma).
+        /// Its CLI must be on PATH. vord then adds its policy, the hook, a
+        /// generated-code manifest and a Gherkin scaffold.
+        ///
+        /// Environment: FERRUM_TEMPLATES=<dir> points `ferrum compile` at
+        /// ferrum's template directory (its `templates/` in the ferrum
+        /// repository); `ferrum init` leaves the project's own empty, so a
+        /// ferrum blueprint fails without it.
+        #[arg(long, requires = "name")]
+        engine: Option<String>,
+        /// Project name passed to the engine.
+        #[arg(long)]
+        name: Option<String>,
+        /// The engine's blueprint: kthulu-plan.yaml (kthulu) or a graph
+        /// YAML (ferrum).
+        #[arg(long)]
+        blueprint: Option<PathBuf>,
+        /// With `--engine <ferrum|kthulu|openapi>` as the backend, also generate a Wasp
+        /// frontend (`wasp`) joined by a shared OpenAPI contract in `contract/`.
+        #[arg(long, requires = "engine", value_parser = ["wasp"])]
+        frontend: Option<String>,
+        /// OpenAPI Generator's generator name (with `--engine openapi`), e.g. typescript-fetch.
+        #[arg(long, requires = "engine")]
+        generator: Option<String>,
+        /// With `--engine copier`: a template answer, `key=value`
+        /// (repeatable), passed as `copier copy --data key=value`.
+        #[arg(long = "data", requires = "engine", conflicts_with = "frontend", value_name = "KEY=VALUE")]
+        data: Vec<String>,
+        /// With `--engine copier`: template tag, branch or commit
+        /// (`--vcs-ref`). Copier otherwise uses the template's latest tag.
+        #[arg(long = "vcs-ref", requires = "engine", conflicts_with = "frontend")]
+        vcs_ref: Option<String>,
+        /// The app to create, as JSON: {"name": "todo", "entities": {"todo":
+        /// {"title": "string", "done": "bool"}}}. With `--engine ferrum`,
+        /// vord derives the engine's graph (CRUD use cases) from it, and with
+        /// `--frontend` the OpenAPI contract too; it is kept as app.json.
+        #[arg(long, conflicts_with = "blueprint")]
+        app: Option<PathBuf>,
+        /// An entity of the app: name:field=type,field=type (repeatable;
+        /// types: string, int, float, bool, uuid, datetime). The inline form
+        /// of `--app`.
+        #[arg(long = "entity", conflicts_with_all = ["blueprint", "app"], value_name = "NAME:FIELD=TYPE,...")]
+        entities: Vec<String>,
+        /// Write the OpenAPI contract derived from `--app`/`--entity` to this
+        /// file and exit (how contract/openapi.yaml is regenerated).
+        #[arg(long, value_name = "FILE")]
+        emit_contract: Option<PathBuf>,
+        /// Install the engine if it is not on PATH (pinned, non-interactive)
+        /// instead of only saying how.
+        #[arg(long, requires = "engine")]
+        install: bool,
+        /// After generating, build the result (`cargo check` for ferrum,
+        /// `go build ./...` for kthulu). A failure is recorded as a
+        /// generator defect and reported, so nobody patches around it.
+        #[arg(long, requires = "engine")]
+        check_build: bool,
+        /// Print every command that would run, install included, and stop.
+        #[arg(long, requires = "engine")]
+        plan: bool,
+        /// Print the scaffolding engine registry (names, languages,
+        /// capabilities, install and regenerate commands) and exit.
+        #[arg(long)]
+        list_engines: bool,
+        /// With `--list-engines`, print JSON.
+        #[arg(long, requires = "list_engines")]
+        json: bool,
+    },
+    /// Generated code that is wrong because the engine's template or the
+    /// blueprint is: report it here instead of patching generated files.
+    /// While one is open, `vord agent done` says the task is not done.
+    Defects {
+        #[command(subcommand)]
+        action: DefectsAction,
+        /// Project root (defaults to the current directory).
+        #[arg(long, global = true, default_value = ".")]
+        path: PathBuf,
+    },
+    /// Verify the API contract: lint it with Redocly and, with `--url`,
+    /// test the running server against it with Schemathesis. A failure is
+    /// recorded as a defect (`vord defects`), so the task is not done until
+    /// the contract or the server is fixed.
+    VerifyContract {
+        /// The OpenAPI document (default: contract/openapi.yaml).
+        #[arg(long, default_value = verify::SPEC)]
+        spec: String,
+        /// Base URL of a running server to test against the contract.
+        #[arg(long)]
+        url: Option<String>,
+        /// Project root (defaults to the current directory).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
+    /// Remove generated files nobody needs (a duplicate frontend, an engine's
+    /// bundled templates) and drop them from `.vord/generated.json`. The
+    /// agent uses this instead of `rm`, which the write gate refuses on
+    /// generated code. Refuses to delete filled holes unless `--force`.
+    Prune {
+        /// Files or directories, relative to the project root.
+        #[arg(required = true)]
+        paths: Vec<String>,
+        /// Project root (defaults to the current directory).
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Delete even files that contain hand-written hole bodies.
+        #[arg(long)]
+        force: bool,
     },
     /// Visualize the component architecture of a directory: import graph
     /// collapsed to components, Martin's Ca/Ce/I/A/D metrics, dependency
@@ -123,6 +257,73 @@ enum ArchFormat {
 }
 
 #[derive(Subcommand)]
+enum RefactorAction {
+    /// Rank refactor candidates (hotspot score = risk × commits) and assign
+    /// each an autonomy tier: auto, review or escalate.
+    Plan {
+        #[command(flatten)]
+        plan: RefactorPlanArgs,
+        /// Output format: text or json.
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Refactor the top candidates, one `vord agent run --refactor` each.
+    /// Escalated candidates are never attempted. Exits 0 when every attempt
+    /// completed, otherwise with the first unsuccessful run's exit code.
+    Run {
+        #[command(flatten)]
+        plan: RefactorPlanArgs,
+        /// Highest tier to attempt: auto or review.
+        #[arg(long, default_value = "review")]
+        max_autonomy: String,
+        /// Model name, overriding the provider's configured default.
+        #[arg(long)]
+        model: Option<String>,
+        /// Write a Markdown pull-request body explaining every attempt.
+        #[arg(long)]
+        report: Option<PathBuf>,
+    },
+}
+
+#[derive(clap::Args)]
+struct RefactorPlanArgs {
+    /// Only candidates under this repository-relative path.
+    #[arg(long, default_value = ".")]
+    scope: String,
+    /// Days of git history to mine for churn and co-change.
+    #[arg(long, default_value_t = 180)]
+    since_days: u32,
+    /// LCOV coverage report, to rank by CRAP and tier by coverage.
+    #[arg(long)]
+    lcov: Option<PathBuf>,
+    /// How many candidates to show (plan) or attempt (run).
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
+}
+
+#[derive(Subcommand)]
+enum DefectsAction {
+    /// List recorded defects.
+    List,
+    /// Record a defect in generated code.
+    Report {
+        /// The engine that generated it (ferrum, kthulu, ...).
+        #[arg(long)]
+        engine: String,
+        /// The generated file that is wrong.
+        #[arg(long)]
+        file: String,
+        /// What is wrong, e.g. "imports Usuario, which does not exist".
+        #[arg(long)]
+        reason: String,
+    },
+    /// The engine or blueprint was fixed and the project regenerated.
+    Resolve { id: u32 },
+    /// The user decided to live with it.
+    Accept { id: u32 },
+}
+
+#[derive(Subcommand)]
 enum AgentAction {
     /// Run one headless session against a task. Exits 0 (the analyzer agrees),
     /// 3 (incomplete), 4 (budget exhausted), 5 (circuit breaker tripped),
@@ -148,6 +349,11 @@ enum AgentAction {
         /// Model name, overriding the provider's configured default.
         #[arg(long)]
         model: Option<String>,
+        /// Refactor task: done also requires behaviour preserved (no new
+        /// constants, operators or branches) and no quality dimension
+        /// degraded past `[agent.refactor]`'s tolerances.
+        #[arg(long)]
+        refactor: bool,
     },
     /// Same as `run`, with a live terminal view of the session attached
     /// (roadmap A6). A spectator, not a second control path: quitting the
@@ -166,6 +372,59 @@ enum AgentAction {
         max_tokens: Option<u64>,
         #[arg(long)]
         model: Option<String>,
+        #[arg(long)]
+        refactor: bool,
+    },
+    /// Fill pending holes, one agent run per hole (see `vord holes`). Each
+    /// run is told exactly which hole to fill, the write gate keeps it inside
+    /// the hole, and whether the hole got filled is re-checked from disk.
+    /// Exits 0 (all filled), 3 (some still pending) or 1 (a run failed).
+    Fill {
+        /// Directory to look for holes in.
+        #[arg(long, default_value = ".")]
+        scope: String,
+        /// Only the hole with this name (or Wasp declaration name).
+        #[arg(long)]
+        hole: Option<String>,
+        /// Holes to attempt in this invocation.
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        /// Model name, overriding the provider's configured default.
+        #[arg(long)]
+        model: Option<String>,
+        /// Model turns each hole's run may take.
+        #[arg(long)]
+        max_turns: Option<u32>,
+        /// Test command (run with `sh -c`). Each hole then goes RED → GREEN:
+        /// a failing test first, then the code, both checked by running it.
+        /// Defaults to `[agent] test_command` in `vord.toml`.
+        #[arg(long)]
+        test: Option<String>,
+    },
+    /// Record what the analyzer sees over `--scope` now, as the baseline
+    /// `vord agent done` later compares against. Run it before another
+    /// host's agent starts (DeepSeek Harness's dsh-vord plugin does).
+    Baseline {
+        #[arg(long, default_value = ".")]
+        scope: String,
+        /// Where to write the baseline.
+        #[arg(long, default_value = vord_cli::agent::DONE_BASELINE_FILE)]
+        out: PathBuf,
+    },
+    /// The analyzer's verdict on whether a task is finished: re-scan
+    /// `--scope` and compare against the baseline. Exits 0 (done), 3 (not
+    /// done; the reason is on stdout) or 1 (could not judge). With `--json`,
+    /// prints `{"done": bool, "reason": string}` instead.
+    Done {
+        #[arg(long, default_value = ".")]
+        scope: String,
+        #[arg(long, default_value = vord_cli::agent::DONE_BASELINE_FILE)]
+        baseline: PathBuf,
+        /// A rule the task must eliminate everywhere in scope.
+        #[arg(long)]
+        rule: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     /// Wait out the late-feedback window on a pull request: poll with
     /// backoff, collect one review batch as one batch, and report quiet, new
@@ -574,14 +833,276 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Some(Command::Agent { action }) => run_agent(action).await,
         Some(Command::Swarm { action }) => run_swarm(action).await,
         Some(Command::Triage { action }) => run_triage(action).await,
-        Some(Command::Kickoff { template, path }) => {
-            kickoff::run_kickoff(&template, &path)?;
+        Some(Command::Refactor { action }) => run_refactor(action).await,
+        Some(Command::Holes { path, json, check }) => {
+            let root = std::env::current_dir()?;
+            let holes = vord_cli::holes::scan(&root, &path);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&holes)?);
+            } else {
+                print!("{}", vord_cli::holes::render_text(&holes));
+            }
+            Ok(ExitCode::from(if check && !holes.is_empty() { 3 } else { 0 }))
+        }
+        Some(Command::Kickoff {
+            template,
+            path,
+            engine,
+            name,
+            blueprint,
+            frontend,
+            generator,
+            data,
+            vcs_ref,
+            app,
+            entities,
+            emit_contract,
+            install,
+            check_build,
+            plan,
+            list_engines,
+            json,
+        }) => {
+            let app_name = name.clone().unwrap_or_else(|| "app".to_string());
+            let app = match (&app, entities.is_empty()) {
+                (Some(file), _) => {
+                    let mut value: serde_json::Value =
+                        serde_json::from_str(&std::fs::read_to_string(file)?)
+                            .map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
+                    if value.get("name").is_none() {
+                        value["name"] = app_name.clone().into();
+                    }
+                    Some(app_spec::AppSpec::from_json(&value.to_string())?)
+                }
+                (None, false) => Some(app_spec::AppSpec::from_entity_flags(&app_name, &entities)?),
+                (None, true) => None,
+            };
+            if let Some(out) = emit_contract {
+                let app =
+                    app.ok_or_else(|| anyhow::anyhow!("--emit-contract needs --app or --entity"))?;
+                std::fs::write(&out, app.openapi())?;
+                println!("vord kickoff: contract written to {}", out.display());
+                return Ok(ExitCode::SUCCESS);
+            }
+            if list_engines {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(kickoff_engine::ENGINES)?);
+                } else {
+                    print!("{}", kickoff_engine::render_engines_text());
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+            let Some(engine) = engine else {
+                kickoff::run_kickoff(&template, &path)?;
+                return Ok(ExitCode::SUCCESS);
+            };
+            if frontend.is_some() {
+                let fullstack = kickoff_engine::FullstackKickoff {
+                    backend: kickoff_engine::Engine::parse(&engine)?,
+                    name: name.expect("clap requires --name with --engine"),
+                    blueprint,
+                    generator,
+                    parent: path,
+                    install,
+                    programs: Default::default(),
+                    app: app.clone(),
+                };
+                if plan {
+                    for line in fullstack.plan() {
+                        println!("{line}");
+                    }
+                    return Ok(ExitCode::SUCCESS);
+                }
+                let mut report = kickoff_engine::run_fullstack(&fullstack)?;
+                if check_build {
+                    kickoff_engine::check_build(
+                        &report.project_dir,
+                        fullstack.backend,
+                        Some("backend"),
+                        &mut report.notes,
+                    );
+                    for o in verify::verify(&report.project_dir, verify::SPEC, None) {
+                        report.notes.push(format!("{} {}: {}", o.name, if o.passed { "passed" } else { "FAILED (recorded as a defect)" }, o.detail));
+                    }
+                }
+                println!(
+                    "vord kickoff: {engine} backend + wasp frontend created in {}; {} marked generated; API contract in contract/openapi.yaml",
+                    report.project_dir.display(),
+                    report.generated
+                );
+                for note in &report.notes {
+                    println!("vord kickoff: {note}");
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+            let blueprint = match (&blueprint, &app) {
+                (None, Some(app)) => Some(kickoff_engine::app_blueprint(
+                    app,
+                    kickoff_engine::Engine::parse(&engine)?,
+                )?),
+                _ => blueprint,
+            };
+            let request = kickoff_engine::EngineKickoff {
+                engine: kickoff_engine::Engine::parse(&engine)?,
+                name: name.expect("clap requires --name with --engine"),
+                blueprint,
+                parent: path,
+                program: None,
+                generator,
+                install,
+                templates: kickoff_engine::ferrum_templates_from_env(),
+                copier: kickoff_engine::CopierOptions { data, vcs_ref },
+                api_only: false,
+            };
+            if plan {
+                request.validate()?;
+                for line in request.plan() {
+                    println!("{line}");
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+            let mut report = kickoff_engine::run(&request)?;
+            if check_build {
+                kickoff_engine::check_build(&report.project_dir, request.engine, None, &mut report.notes);
+            }
+            if let Some(app) = &app {
+                kickoff_engine::record_app(app, &report.project_dir)?;
+            }
+            println!(
+                "vord kickoff: {} created {} file(s) in {}; {} marked generated (edit their blueprint, not the files)",
+                engine,
+                report.created,
+                report.project_dir.display(),
+                report.generated
+            );
+            for note in &report.notes {
+                println!("vord kickoff: {note}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Command::VerifyContract { spec, url, path }) => {
+            let outcomes = verify::verify(&path, &spec, url.as_deref());
+            let mut failed = false;
+            for o in &outcomes {
+                failed |= !o.passed;
+                println!("vord verify-contract: {} {}: {}", o.name, if o.passed { "passed" } else { "FAILED" }, o.detail);
+            }
+            if failed {
+                println!("vord verify-contract: recorded in {}; fix the contract or the server, then `vord defects resolve <id>`", generator_defects::DEFECTS_FILE);
+            }
+            Ok(ExitCode::from(if failed { 3 } else { 0 }))
+        }
+        Some(Command::Prune { paths, path, force }) => {
+            let removed = prune::prune(&path, &paths, force)?;
+            println!("vord prune: removed {} and dropped it from .vord/generated.json", removed.join(", "));
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Command::Defects { action, path }) => {
+            match action {
+                DefectsAction::List => {
+                    let all = generator_defects::list(&path);
+                    if all.is_empty() {
+                        println!("vord defects: none recorded");
+                    }
+                    for d in all {
+                        println!("#{} [{}] {} ({}): {}", d.id, d.status, d.file, d.engine, d.reason);
+                    }
+                }
+                DefectsAction::Report { engine, file, reason } => {
+                    let d = generator_defects::report(&path, &engine, &file, &reason)?;
+                    println!(
+                        "vord defects: #{} recorded for {} ({}). Do not patch the generated file: fix the blueprint or {}'s template, regenerate, then `vord defects resolve {}`.",
+                        d.id, d.file, d.engine, d.engine, d.id
+                    );
+                }
+                DefectsAction::Resolve { id } => {
+                    generator_defects::close(&path, id, "resolved")?;
+                    println!("vord defects: #{id} resolved");
+                }
+                DefectsAction::Accept { id } => {
+                    generator_defects::close(&path, id, "accepted")?;
+                    println!("vord defects: #{id} accepted");
+                }
+            }
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Arch { path, format, html }) => run_arch(&path, format, html),
         Some(Command::Mcp) => {
             mcp::run_mcp_server()?;
             Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+/// `vord refactor`: plan, or plan and run, from the repository's git top
+/// level — history paths and scan paths must share one root to join.
+async fn run_refactor(action: RefactorAction) -> anyhow::Result<ExitCode> {
+    use vord_agent::plan::Autonomy;
+    use vord_cli::refactor;
+
+    let cwd = std::env::current_dir()?;
+    let root = vord_cli::find_git_root(&cwd)
+        .ok_or_else(|| anyhow::anyhow!("vord refactor needs a git repository (for history)"))?;
+    let (plan_args, limit) = match &action {
+        RefactorAction::Plan { plan, .. } | RefactorAction::Run { plan, .. } => (
+            refactor::PlanArgs {
+                scope: plan.scope.clone(),
+                since_days: plan.since_days,
+                lcov: plan.lcov.clone(),
+            },
+            plan.limit,
+        ),
+    };
+    let plan = refactor::build_plan(&root, &plan_args).await?;
+    match action {
+        RefactorAction::Plan { format, .. } => {
+            match format.as_str() {
+                "json" => {
+                    let shown = serde_json::json!({
+                        "candidates": &plan.candidates[..limit.min(plan.candidates.len())],
+                        "temporal_couplings": &plan.temporal_couplings
+                            [..limit.min(plan.temporal_couplings.len())],
+                    });
+                    println!("{}", serde_json::to_string_pretty(&shown)?);
+                }
+                "text" => print!("{}", refactor::render_text(&plan, limit)),
+                other => anyhow::bail!("unknown format {other:?}: use text or json"),
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        RefactorAction::Run {
+            max_autonomy,
+            model,
+            report,
+            ..
+        } => {
+            let ceiling = match max_autonomy.as_str() {
+                "auto" => Autonomy::Auto,
+                "review" => Autonomy::Review,
+                other => anyhow::bail!("unknown --max-autonomy {other:?}: use auto or review"),
+            };
+            let attempts = refactor::run(&root, &plan, limit, ceiling, model).await?;
+            if attempts.is_empty() {
+                println!("vord refactor: no candidate within --max-autonomy {max_autonomy}");
+            }
+            let mut exit = 0;
+            for attempt in &attempts {
+                println!(
+                    "[{}] {}:{} — {}",
+                    attempt.candidate.autonomy.as_str(),
+                    attempt.candidate.path,
+                    attempt.candidate.line,
+                    attempt.outcome.describe()
+                );
+                if exit == 0 {
+                    exit = attempt.outcome.exit_code();
+                }
+            }
+            if let Some(path) = report {
+                std::fs::write(&path, refactor::render_report(&attempts))
+                    .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", path.display()))?;
+            }
+            Ok(ExitCode::from(exit))
         }
     }
 }
@@ -630,6 +1151,7 @@ async fn run_agent(action: AgentAction) -> anyhow::Result<ExitCode> {
             max_turns,
             max_tokens,
             model,
+            refactor,
         } => {
             let args = vord_cli::agent::AgentArgs {
                 task,
@@ -638,6 +1160,7 @@ async fn run_agent(action: AgentAction) -> anyhow::Result<ExitCode> {
                 max_turns,
                 max_tokens,
                 model,
+                refactor,
             };
             let outcome = vord_cli::agent::run(&root, args).await?;
             vord_cli::agent::report(&outcome);
@@ -650,6 +1173,7 @@ async fn run_agent(action: AgentAction) -> anyhow::Result<ExitCode> {
             max_turns,
             max_tokens,
             model,
+            refactor,
         } => {
             let args = vord_cli::agent::AgentArgs {
                 task,
@@ -658,10 +1182,82 @@ async fn run_agent(action: AgentAction) -> anyhow::Result<ExitCode> {
                 max_turns,
                 max_tokens,
                 model,
+                refactor,
             };
             let outcome = tui::run(&root, args).await?;
             vord_cli::agent::report(&outcome);
             Ok(ExitCode::from(outcome.exit_code()))
+        }
+        AgentAction::Fill {
+            scope,
+            hole,
+            limit,
+            model,
+            max_turns,
+            test,
+        } => {
+            let settings = vord_infra_fs::VordConfig::load_from_dir(&root)
+                .map(|c| c.agent)
+                .unwrap_or_default();
+            let tests = test
+                .or(settings.test_command)
+                .map(|command| vord_cli::holes::TestGate {
+                    command,
+                    timeout: std::time::Duration::from_secs(
+                        settings
+                            .command_timeout_secs
+                            .unwrap_or(vord_cli::holes::TEST_TIMEOUT_SECS),
+                    ),
+                });
+            let args = vord_cli::holes::FillArgs {
+                scope,
+                only: hole,
+                limit,
+                model,
+                max_turns,
+                tests,
+            };
+            let attempts = vord_cli::holes::fill(&root, &args).await?;
+            if attempts.is_empty() {
+                println!("vord agent fill: no pending holes to fill");
+                return Ok(ExitCode::SUCCESS);
+            }
+            print!("{}", vord_cli::holes::render_attempts(&attempts));
+            Ok(ExitCode::from(vord_cli::holes::exit_code(&attempts)))
+        }
+        AgentAction::Baseline { scope, out } => {
+            let count = vord_cli::agent::write_baseline(&root, &scope, &out).await?;
+            println!(
+                "vord agent: baseline of {count} finding(s) written to {}",
+                out.display()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        AgentAction::Done {
+            scope,
+            baseline,
+            rule,
+            json,
+        } => {
+            if let Some(reason) = generator_defects::blocking_reason(&root) {
+                if json {
+                    println!("{}", serde_json::json!({ "done": false, "reason": reason }));
+                } else {
+                    println!("vord agent: {reason}");
+                }
+                return Ok(ExitCode::from(3));
+            }
+            let verdict =
+                vord_cli::agent::check_done(&root, &scope, &baseline, rule.as_deref()).await?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "done": verdict.is_done(), "reason": verdict.describe() })
+                );
+            } else {
+                println!("vord agent: {}", verdict.describe());
+            }
+            Ok(ExitCode::from(if verdict.is_done() { 0 } else { 3 }))
         }
         AgentAction::WatchPr {
             pr,
@@ -831,10 +1427,11 @@ fn print_roles(roles: &[vord_cli::swarm::RoleReport]) {
     }
     for role in roles {
         println!(
-            "{} — worktree {} (branch {}), +{} protected path(s), +{} blocking rule(s), +{} escalate rule(s)",
+            "{} — worktree {} (branch {}), model {}, +{} protected path(s), +{} blocking rule(s), +{} escalate rule(s)",
             role.name,
             role.plan.path.display(),
             role.plan.branch,
+            role.model.as_deref().unwrap_or("default"),
             role.extra_protected_paths,
             role.extra_blocking_rules,
             role.extra_escalate_rules,

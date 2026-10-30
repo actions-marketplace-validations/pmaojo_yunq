@@ -71,7 +71,15 @@ configuration, where turning it off leaves no trace in a diff.
 
 ### As a [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin
 
-DeepSeek Harness's official `dsh-hooks-claude-code` bridge runs the exact
+[`integrations/deepseek-harness/dsh-vord/`](integrations/deepseek-harness/dsh-vord/)
+is a native dsh plugin and profile bundle: vord judges `write`/`edit`/
+`str_replace_editor` on dsh's own `tools/pre-execute` and `tools/post-execute`,
+holds the turn open on `agent/turn-stopping` while the analyzer sees findings
+the session introduced (`vord agent baseline` / `vord agent done`) or test
+evidence is pending,
+and mounts `vord mcp` as tools (`dsh plugin --profile <name> add <path>`).
+
+Alternatively, DeepSeek Harness's official `dsh-hooks-claude-code` bridge runs the exact
 `PreToolUse`/`PostToolUse` payload shape `vord hook claude-code` already
 speaks — no new vord code needed, just wiring. See
 [`integrations/deepseek-harness/`](integrations/deepseek-harness/) for the
@@ -108,6 +116,11 @@ planning, agree a spec with `spec_propose` before code, decompose into a
 each task only once `memory_patch` accepts an `## Evidencia` section backed
 by real command output. Use it at the start of any session in such a
 repository, before reading code or planning work.
+
+`skills/continuous-refactor/` is a fifth: choose what to refactor from
+complexity, coverage and git history (`vord refactor plan`), then refactor
+it under the refactor guard — no new finding, no behaviour-bearing syntax
+changed, no quality dimension degraded. See [`vord refactor`](#vord-refactor--continuous-refactoring).
 
 ## Topology
 
@@ -574,8 +587,16 @@ out of.
 export ANTHROPIC_API_KEY=...            # or VORD_LLM_* for any OpenAI-compatible endpoint
 vord agent run --task "remove the shell injection in scripts/deploy.py"
 vord agent run --task "fix it" --rule python:subprocess-shell-true --scope scripts
+vord agent run --refactor --task "simplify parse_config without changing behaviour"
 vord agent watch-pr --pr 42             # wait out the late review/CI window on a PR
 ```
+
+The completion check is also available to agent loops vord does not drive
+(DeepSeek Harness via `dsh-vord`, opencode via `opencode-vord`, a CI step): `vord agent baseline` records
+what the analyzer sees before the agent starts, and `vord agent done`
+re-scans and exits `0` when nothing new appeared, `3` with the objection when
+something did (`--json` for `{"done", "reason"}`, `--rule` to require a rule
+be gone).
 
 Runs locally against Qwen, Llama, DeepSeek or anything else an
 OpenAI-compatible `/v1/chat/completions` endpoint fronts — Ollama, vLLM,
@@ -651,6 +672,35 @@ max_tokens = 500000
 max_rejections = 3
 allowed_commands = ["cargo", "npm", "pytest"]   # replaces the built-in list
 command_timeout_secs = 300
+test_command = "cargo test"   # vord agent fill goes RED → GREEN per hole
+```
+
+**Refactor tasks: `--refactor`.** "No new finding" is the wrong bar for a
+refactor. Splitting one module into five adds no finding anywhere and still
+raises coupling everywhere the five import each other; rewriting `x > 10` as
+`x >= 10` adds no finding and changes behaviour. `vord agent run --refactor`
+holds the task to two more checks, each deterministic:
+
+- **Behaviour preserved.** Every file in scope is fingerprinted as a
+  multiset of literals, operators and control-flow constructs
+  (`vord_ast::SemanticFingerprint`). A constant or operator that appears or
+  vanishes, or an extra `if`/loop/`throw`, is *semantic drift*. Renames,
+  extractions, moves between files, inlining and deduplication pass.
+- **No quality dimension degraded** (`vord_agent::quality`): health score,
+  debt, duplicated lines, complex functions, max cyclomatic complexity,
+  import edges, component edges and import cycles are measured before and
+  after, and any dimension worse than its tolerance is a *trade-off* the
+  model is sent back to resolve — surfaced dimension by dimension, never
+  averaged away.
+
+An analyzer that cannot take those measurements fails the run (exit 1)
+rather than letting it pass unchecked.
+
+```toml
+[agent.refactor]
+preserve_behaviour = true      # default
+[agent.refactor.tolerances]
+import_edges = 2               # may worsen by up to 2; every other dimension by 0
 ```
 
 ## `vord swarm` — multiple agents, isolated and scoped
@@ -704,11 +754,62 @@ worktree_root = ".vord/worktrees"   # default
 
 [[swarm.role]]
 name = "cleaner"
+model = "qwen2.5-coder:32b"   # per-role model, overriding VORD_LLM_MODEL
+refactor = true               # this role's runs use the refactor guard
 
 [[swarm.role.protected_paths]]
 pattern = ".github/workflows/**"
 reason = "CI definitions need human review."
 ```
+
+`model` lets each role run on the model that is best at its own sub-task
+(a long-context planner, a cheap local refactorer); `refactor` holds a
+role's runs to `--refactor`'s guard.
+
+## `vord refactor` — continuous refactoring
+
+Refactoring once in a while does not keep up with code that changes every
+day, and "refactor everything" is neither affordable nor safe. `vord
+refactor` makes it a bounded, repeatable batch:
+
+```sh
+vord refactor plan                           # rank candidates (text)
+vord refactor plan --lcov lcov.info --format json
+vord refactor run --limit 3 --max-autonomy review --report vord-refactor.md
+```
+
+`plan` ranks every function above the complexity threshold (cyclomatic
+> 10, or CRAP ≥ 30 when coverage is supplied) by a hotspot score —
+`risk × (1 + commits)`, with risk the CRAP score when coverage is known and
+cyclomatic complexity otherwise, and commits mined from `git log` over
+`--since-days` (180 by default). Complex code nobody touches is cheap to
+leave alone; complex code that changes every week is where debt costs
+money. Each candidate also gets an **autonomy tier** from its blast radius
+(files importing it) and its test protection (line coverage):
+
+| Tier | When | Meaning |
+|---|---|---|
+| `auto` | ≤ 2 dependents and ≥ 80% covered | the analyzer's verdict is enough |
+| `review` | anything in between, or coverage unknown | a human reviews the PR |
+| `escalate` | ≥ 10 dependents, or < 30% covered | never attempted autonomously |
+
+The plan also reports **hidden temporal coupling**: pairs of source files
+that changed together in at least three commits with no import between
+them — a constraint the code does not state and a refactor should not
+break.
+
+`run` drives one `vord agent run --refactor` per candidate, top first,
+skipping anything above `--max-autonomy` and never attempting `escalate`.
+`--report` writes a pull-request body that explains, per attempt, why the
+candidate was chosen, how its run ended, and the before/after of every
+quality dimension — so a reviewer judges intent and taste, not what the
+analyzer already proved. [`ci-templates/github-actions-refactor.yml`](ci-templates/github-actions-refactor.yml)
+runs plan → run → pull request nightly; nothing merges on its own.
+
+`vord refactor` runs from the repository's git top level, since history and
+scan paths must share one root. The design and how it maps to the open
+problems of continuous autonomous refactoring are in
+[`docs/design/continuous-refactoring.md`](docs/design/continuous-refactoring.md).
 
 ## `vord triage` — the Issue Triage Factory
 
@@ -762,6 +863,249 @@ Supported templates:
 - `python-clean` (or `python`): Enforces modern type hints and strict resource management.
 - `typescript-clean` (or `ts`): Restricts wildcard re-exports and enforces naming conventions.
 - `fullstack-hexagonal` (or `hexagonal`): A complete backend/frontend setup with `architecture.yaml` and blocking rules for hexagonal layer violations and circular dependencies.
+
+### Scaffolding engines
+
+Deterministic work belongs to a generator, not to an agent. `--engine` runs
+a real scaffolding engine and then makes its output governed from the first
+commit:
+
+```sh
+vord kickoff --engine kthulu --name shop --blueprint kthulu-plan.yaml   # Go modular monolith (pmaojo/kthulu-go)
+vord kickoff --engine ferrum --name shop --blueprint gen/users.yaml     # Rust + React hexagonal (pmaojo/ferrum)
+vord kickoff --engine wasp   --name shop                                # React + Node + Prisma (wasp-lang/wasp)
+vord kickoff --engine copier --name api --blueprint gh:fastapi/full-stack-fastapi-template --vcs-ref 0.9.0 --data project_name=Demo   # any Copier template; `copier update` regenerates
+vord kickoff --engine openapi --name client --blueprint api.yaml --generator typescript-fetch  # code from an OpenAPI spec
+vord kickoff --engine openapi --name api --blueprint api.yaml --generator python-fastapi        # Python: spec-first, regenerable
+vord kickoff --engine ferrum --frontend wasp --name shop                # backend + Wasp frontend, shared OpenAPI contract
+# also --engine openapi --generator <server generator> --blueprint api.yaml --frontend wasp (your spec is the contract)
+```
+
+With `--frontend`, `contract/openapi.yaml` is the OpenAPI document the backend
+engine produced (found as `openapi`/`swagger` `.yaml`/`.yml`/`.json` in
+`backend/`); if it produced none, an empty stub is written and kickoff says so.
+The frontend's typed client is then generated from it with a pinned
+`npx -y openapi-typescript@7.13.0` into `frontend/src/api/schema.ts`, headed
+`Code generated ... DO NOT EDIT` and recorded in the manifest (regenerate:
+`cd frontend && npx -y openapi-typescript@7.13.0 ../contract/openapi.yaml -o src/api/schema.ts`).
+Without `npx` that step is skipped with a message, not a failure.
+
+Ferrum's `compile` needs its template directory: set `FERRUM_TEMPLATES=<ferrum checkout>/templates`; without it `--blueprint` stops with a message naming the variable. If git ignores `.vord/generated.json` (a broad `.vord/` line), kickoff warns: commit the manifest, ignore only `.vord/sessions/`.
+
+**Describe the app, don't hand-write the blueprint.** `--entity
+todo:title=string,done=bool` (repeatable; or `--app app.json`, or the MCP
+`entities` argument) derives, deterministically, ferrum's graph (one module
+per entity with list/get/create/update/delete use cases) and, with
+`--frontend wasp`, the REST contract `contract/openapi.yaml`. The description
+is kept as `app.json`; the contract is recorded in the manifest with
+`vord kickoff --app app.json --emit-contract contract/openapi.yaml` as its
+regeneration command. ferrum's seeded `users` example is removed once the
+project has its own graph. Verified end to end with a real ferrum (pmaojo/ferrum#324), a real Wasp
+0.25 (`wasp new -t minimal`; needs Node 24.14+ and npm 11.11+) and
+`openapi-typescript`: the full-stack todo builds (`--check-build` passes).
+The same `--entity` description also drives three Node-based engines, each
+checked with the real tool: `--engine typespec` (writes `main.tsp`, compiles to
+OpenAPI under `tsp-output/`, TypeSpec 1.16), `--engine zenstack` (writes
+`zenstack/schema.zmodel`, `zen generate`, ZenStack 3.9) and `--engine projen`
+(project configuration as code, `--generator typescript|…`; edit `.projenrc`,
+never the generated files). Generated headers ("Generated by projen",
+"DO NOT MODIFY THIS FILE") are guarded like the others. Not verified: ZenStack
+access policies (`@@allow`) are left out of the derived model.
+
+**Contract verification.** `vord verify-contract [--url http://localhost:3000]`
+(MCP: `vord_verify_contract`) lints `contract/openapi.yaml` with Redocly CLI
+2.57 and, with `--url`, runs Schemathesis 4.29 against the live server; each
+failure is recorded as a generator defect (engine `contract`), which blocks
+`vord agent done`. `--check-build` on a full-stack kickoff also lints the
+contract. Schemathesis was verified against a toy server, not yet against a
+real ferrum server.
+
+Only ferrum derives a blueprint (kthulu needs `--blueprint`). In a full-stack
+project ferrum runs `--api-only` and Wasp uses its `minimal` template; ferrum
+still emits some React files under `backend/frontend/`, and its crate lives
+in `backend/backend/` (its own layout).
+
+**Generated code that does not build.** `--check-build` (MCP: `check_build`)
+runs `cargo check` (ferrum, in `backend/`) or `go build ./...` (kthulu) after
+generating. A failure is recorded in `.vord/generator-defects.json` and
+reported; so is anything an agent reports with the `vord_report_generator_defect`
+tool (`vord defects report --engine E --file F --reason R`). The point: when
+the template or blueprint is wrong, the agent must not patch around a
+`DO NOT EDIT` file. `vord agent done` / `vord_done` answers not-done while a
+defect is open, until it is fixed upstream and `vord defects resolve <id>`, or
+the user runs `vord defects accept <id>`. Verified with a real ferrum: it
+found a real defect (`ethercat_rs` does not exist on crates.io, so ferrum's
+`backend/Cargo.toml` never resolves). ferrum's own `templates/` now come with
+`ferrum init` (pmaojo/ferrum#324), so `FERRUM_TEMPLATES` is only needed with
+older builds.
+
+**Cleaning up what you do not need.** `vord prune <paths>` (MCP `vord_prune`)
+removes generated files or directories (ferrum's leftover `backend/frontend/`,
+bundled `templates/`) and drops them from `.vord/generated.json`, recording
+them in `.vord/pruned.json`; it refuses files holding filled holes unless
+`--force`. `rm` stays refused on generated code (dsh-vord says so and points
+here), because a silent deletion hides that the next regeneration brings the
+files back.
+
+Every kickoff also writes `.vord/agent-baseline.json` (what `vord_done`
+compares against), an `.mcp.json` offering `vord mcp` to Claude Code, and
+warns when `vord` is not on `PATH` (without it the write gate does nothing).
+`vord holes` lists the `vord:hole` markers an engine left; engines that
+generate complete code leave none.
+
+`--plan` prints every command (the install included) plus a preflight line
+when the engine is missing, and stops; `--install`
+installs a missing engine with a pinned, non-interactive command (Wasp's
+piped-shell installer is never run for you; for Wasp `--install` does
+nothing and says so). Otherwise the engine's CLI must
+be on `PATH`. After it runs, vord installs its policy
+and the Claude Code hook (as `vord hook install` does), adds a Gherkin
+scaffold, and records every file the engine **marked as generated** in
+`.vord/generated.json`, along with the blueprint and the command that
+regenerates it. For Wasp, `.wasp/**` (regenerated from `main.wasp` on every
+compile) becomes a protected path.
+
+**Regenerable vs seed.** Not all scaffolding is a build artifact. Output that
+is rebuilt from a source (Symfony-style: kthulu plan, ferrum DSL, OpenAPI,
+TypeSpec, ZenStack, Projen, the derived contract) is `regenerable` in
+`.vord/generated.json`: a hand edit would be lost, so the write gate blocks it.
+Output of a one-pass scaffold (Rails-style: the Wasp template, a Copier
+template) is a `seed`: recorded as a starting point and fully editable and
+deletable, never blocked. Files an engine marks as generated (header or hole)
+stay regenerable even in a seed engine (Wasp's `.wasp/`). Manifests without a
+`kind` mean `regenerable`.
+
+A file counts as generated when the engine marks it: a standard
+`Code generated … DO NOT EDIT` or `@generated` header, or a hole. Unmarked
+files are starter code the project owns and stay freely editable.
+
+**Python.** There are two paths, and only one is regenerable.
+
+- **Spec-first (regenerable): `vord kickoff --engine openapi --generator
+  python-fastapi --blueprint api.yaml --name api`.** The OpenAPI spec is the
+  blueprint (kept at `spec/api.yaml`); OpenAPI Generator emits the models,
+  the routers and `Base*Api` classes. You write the handlers as your own
+  modules under `src/<package>/impl/`, subclassing the generated `Base*Api`
+  (the generated router loads every module in `impl/`). This generator has
+  no `*_impl.py` stubs; `impl/` is that mechanism. vord lists `impl/**`,
+  `tests/**` and the project scaffolding (`README.md`, `.gitignore`,
+  `requirements.txt`, `pyproject.toml`, `setup.cfg`, `Dockerfile`,
+  `docker-compose.yaml`) in `.openapi-generator-ignore` after the first
+  generation, so the generator never rewrites them, and does not lock them in
+  the manifest. Models, routers and `main.py` are locked: the hook denies
+  edits to them. Change the spec, then run the recorded command from the
+  project root: `openapi-generator-cli generate -i spec/api.yaml -g
+  python-fastapi -o .` (needs a JDK; the version is pinned in
+  `openapitools.json`). Your `impl/` code is untouched. Other server
+  generators work the same way, but vord only knows the hand-written paths of
+  `python-fastapi`: for any other generator everything the generator writes is
+  locked, and you list the files you own in `.openapi-generator-ignore` and
+  remove them from `.vord/generated.json` yourself.
+  With a Wasp frontend: `vord kickoff --engine openapi --generator
+  python-fastapi --blueprint api.yaml --frontend wasp --name app` puts the
+  backend in `backend/`, copies your spec verbatim to `contract/openapi.yaml`
+  and generates the frontend's typed client from it.
+- **Copier (one-shot seed for FastAPI).** `--engine copier` runs any Copier
+  template.
+  `--data key=value` (repeatable; MCP: a `data` object) answers the template's
+  questions as `copier copy --data`, and `--vcs-ref <tag|branch|commit>` pins
+  the template version (Copier otherwise takes the template's latest tag).
+  Copier's output is starter code the project owns: nothing is locked unless
+  the template writes a `DO NOT EDIT`/`@generated`/hole marker. The template's
+  answers file (`.copier-answers.yml`, or wherever its `_answers_file` points)
+  is what lets `copier update --defaults --trust` re-apply the template; that
+  needs a repository with a clean tree, so run `git init`, `git add -A` and a
+  first commit before regenerating.
+- **FastAPI via Copier is a one-shot seed, not a regenerable backend.**
+  `fastapi/full-stack-fastapi-template` is no longer a Copier
+  template after tag 0.9.0 (no `copier.yml`; Copier's default of "latest
+  tag" fails on its dangling `.claude/skills` symlinks), so pin
+  `--vcs-ref 0.9.0`. That version needs no `--data` (every question has a
+  default, including `changethis` secrets; override with e.g.
+  `--data secret_key=...`). It writes its answers to
+  `.copier/.copier-answers.yml` and also copies the template's own `.git`
+  into the project: delete it and `git init` yourself. `copier update` does
+  not work on that result, so treat it as a one-shot seed.
+- **Django**: use a Copier template you trust (same flow, same
+  regeneration), or seed with `django-admin startproject <name>` followed by
+  `vord hook install`. The `startproject` route is a one-shot seed: it
+  cannot be regenerated and vord records no blueprint for it.
+- **Python backend + Wasp frontend from a Copier seed** (`--engine copier
+  --frontend wasp`) is not supported: Copier emits no OpenAPI contract. Use
+  the spec-first path above.
+
+**Holes.** A generator marks where hand-written code goes:
+
+```go
+func Place(o Order) error {
+	// vord:hole place-rules
+	// vord:end-hole
+	return repo.Save(o)
+}
+```
+
+The write gate (hook, `vord agent`, dsh-vord) lets an agent change what
+sits between `vord:hole` and `vord:end-hole`. A write that changes anything
+else in a generated file is denied under `generated:edit-outside-hole`. The
+denial names the blueprint and the regenerate command, so the agent changes
+the blueprint instead of making an edit the next regeneration would throw
+away. The markers work under any comment syntax.
+A file that declares holes is held to them even when no kickoff recorded
+it, so output from a generator vord did not run is protected too.
+
+### Hole-driven development: `vord holes` and `vord agent fill`
+
+The generator writes what the blueprint determines, the model writes only
+what is left, and the analyzer decides when it is done. Finding what is
+left is deterministic, so no model does it:
+
+```sh
+vord holes            # pending holes, one per line
+vord holes --json     # the same, for tools (also the `vord_holes` MCP tool)
+vord holes --check    # exit 3 while any hole is pending, for CI
+```
+
+A hole is pending while its body is empty or still holds a placeholder
+(`TODO`-style stubs, `not implemented`, `todo!()`, `AI_FILL`…). An empty
+`*-imports` hole is support space for its siblings, never work by itself.
+For Wasp no markers are needed: every query, action, page or job that
+`main.wasp` imports from `src/` but that does not exist yet is a hole.
+
+`vord agent fill` runs one `vord agent` session per pending hole, with a task
+naming the file, the hole and its lines. The write gate keeps the model
+inside the hole, and whether the hole got filled is checked again on disk
+afterwards, never taken from the model. It exits 0 when every attempted hole
+is filled, 3 when some remain, 1 when a run failed.
+
+```sh
+vord agent fill --limit 5                      # the first five pending holes
+vord agent fill --hole order-service-create    # just one
+vord agent fill --test "go test ./..."         # each hole RED → GREEN
+```
+
+**Test-first, enforced by running the tests.** With `--test` (or
+`[agent] test_command` in `vord.toml`) each hole takes two runs, and vord
+checks each one by running the suite itself instead of trusting the model to
+follow TDD:
+
+1. The suite must pass before the hole is started; a red result later would
+   prove nothing. If it is already red, fill stops.
+2. **RED**: the model writes a test for the hole and nothing else. Refused
+   unless the suite now fails, the hole is still pending and a file changed.
+3. **GREEN**: the model fills the hole. Refused unless the hole is filled,
+   the suite passes and every file the RED run wrote is byte-for-byte
+   unchanged: weakening an assertion to pass is a behaviour change, and
+   belongs in the spec.
+
+A refused hole counts as not done (exit 3). Whether a RED failure is an
+assertion rather than a compile error is not checked yet.
+
+Inside DeepSeek Harness the model is the harness's own: [dsh-vord](integrations/deepseek-harness/dsh-vord)
+does not let a turn close while a hole in a file the session wrote is still
+pending, and `mcp__vord__vord_holes` gives the model its list of tasks.
+In opencode, [opencode-vord](integrations/opencode/opencode-vord) sends the
+same objection back into the session when it goes idle, and the list is
+`vord_vord_holes`.
 
 ## `vord fix` — automated AI remediation
 
